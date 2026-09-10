@@ -1,0 +1,517 @@
+import * as THREE from "three";
+import { MeshManager, FragmentsModel } from "./src/model";
+
+import {
+  VirtualModelConfig,
+  LoadProgressEvent,
+  MultiThreadingRequestClass,
+  isRawBuffer,
+} from "./src";
+import { FragmentsConnection } from "./src/multithreading/fragments-connection";
+import { ThreadHandler } from "./src/multithreading/connection-handlers";
+import { Event } from "../Utils";
+import { Editor } from "./src/edit";
+
+export * from "./src";
+
+declare const __FRAGMENTS_VERSION__: string;
+
+export interface FragmentsModelsOptions {
+  /**
+   * If true, creates classic (non-module) workers. Use together with `toClassicWorker()`.
+   */
+  classicWorker?: boolean;
+  /**
+   * Effective max worker cap. Defaults to `navigator.hardwareConcurrency - 3`, floored at 2. Set explicitly for CI environments or when you know your workload.
+   */
+  maxWorkers?: number;
+  /**
+   * Reserved worker capacity per named thread group. Workers are spawned lazily (nothing is spawned until the first load targets a pool). A model loaded with `threadGroup: "x"` always lands on group "x"'s pool; default-pool loads never touch a reserved worker. The sum of group sizes must leave at least one slot for the default pool, otherwise init throws.
+   */
+  threadGroups?: Record<string, number>;
+}
+
+/**
+ * The main class for managing multiple 3D models loaded from fragments files. Handles loading, disposing, updating, raycasting, highlighting and coordinating multiple FragmentsModel instances. This class acts as the main entry point for working with fragments models. A FragmentsModels instance needs a worker to process fragments off the main thread. The recommended way to obtain the worker URL is via the static FragmentsModels.getWorker method, which fetches the version-matched worker from unpkg. Check the method docs for more info.
+ */
+export class FragmentsModels {
+  private static _workerURL: string | null = null;
+  private static _workerPromise: Promise<string> | null = null;
+
+  /**
+   * Fetches the fragments worker from unpkg for the exact version of this
+   * `@thatopen/fragments` package and returns a blob URL you can pass to the
+   * `FragmentsModels` constructor. The result is cached, so calling this
+   * method more than once is cheap.
+   *
+   * This is the recommended way to obtain the worker URL — it guarantees the
+   * worker version matches the library version and requires no copying of
+   * files into your project.
+   *
+   * @example
+   * ```ts
+   * const workerURL = await FragmentsModels.getWorker();
+   * const fragments = new FragmentsModels(workerURL);
+   * ```
+   *
+   * @returns A blob URL pointing to the fragments worker script.
+   */
+  static async getWorker(): Promise<string> {
+    if (FragmentsModels._workerURL) return FragmentsModels._workerURL;
+    if (FragmentsModels._workerPromise) return FragmentsModels._workerPromise;
+
+    FragmentsModels._workerPromise = (async () => {
+      const url = `https://unpkg.com/@thatopen/fragments@${__FRAGMENTS_VERSION__}/dist/worker/worker.mjs`;
+      const response = await fetch(url);
+      if (!response.ok) {
+        throw new Error(
+          `Failed to fetch fragments worker from ${url}: ${response.status} ${response.statusText}`,
+        );
+      }
+      const blob = await response.blob();
+      const file = new File([blob], "worker.mjs", { type: "text/javascript" });
+      const objectURL = URL.createObjectURL(file);
+      FragmentsModels._workerURL = objectURL;
+      return objectURL;
+    })();
+
+    try {
+      return await FragmentsModels._workerPromise;
+    } catch (error) {
+      FragmentsModels._workerPromise = null;
+      throw error;
+    }
+  }
+
+  /**
+   * Event triggered when a model is loaded.
+   * @event
+   * @type {Event<FragmentsModel>}
+   */
+  readonly onModelLoaded = new Event<FragmentsModel>();
+
+  /**
+   * The manager that handles all loaded fragments models.
+   * Provides functionality to:
+   * - Store and retrieve models by ID
+   * - Track model loading/unloading
+   * - Coordinate updates across models
+   * - Handle model disposal
+   */
+  models: MeshManager;
+
+  /** Settings that control the behavior of the FragmentsModels system */
+  settings = {
+    /** Whether to automatically coordinate model positions relative to the first loaded model */
+    autoCoordinate: true,
+    /** Maximum rate (in milliseconds) at which visual updates are performed */
+    maxUpdateRate: 100,
+    /** Graphics quality level - 0 is low quality, 1 is high quality */
+    graphicsQuality: 0,
+    /**
+     * @deprecated The polling-based force-flush implementation has
+     * been replaced by a sequence-fence one (`forceUpdateFinish`
+     * resolves the moment a FINISH stamped with the relevant seq
+     * arrives). These knobs are no longer read; kept only to avoid
+     * breaking apps that set them.
+     */
+    forceUpdateRate: 200,
+    /** @deprecated See {@link forceUpdateRate}. */
+    forceUpdateBuffer: 200,
+    /**
+     * Interval in milliseconds to flush queued mesh requests from thread to
+     * main thread. Set this once at FragmentsModels construction; changing
+     * it after a model has been loaded has no effect on already-loaded
+     * models (they keep the value they were created with).
+     *
+     * Default 16 ms (one frame at 60 Hz). The previous 64 ms default
+     * left tile updates sitting in the worker's outflow buffer for up
+     * to ~1 frame longer than necessary; lowering it tightens the
+     * latency between worker work and visible result on every
+     * interaction. Apps with very heavy worker output may want to
+     * raise this to reduce postMessage frequency.
+     */
+    meshConnectionRate: 16,
+    /**
+     * Number of queued mesh requests that triggers an immediate flush.
+     * Same setup-time semantics as {@link meshConnectionRate}. Default
+     * 4 — bursts of work flush within a frame instead of being
+     * pinned to the rate timer.
+     */
+    meshConnectionThreshold: 4,
+    /**
+     * Delay in milliseconds between worker-side update loops when work is
+     * complete. Note: each worker has a single shared update loop, so when
+     * multiple models share a worker (default round-robin pool, or any
+     * `threadGroup`), the most recently loaded model's value applies to
+     * every model on that worker. Set this once at FragmentsModels
+     * construction and treat it as a global tuning knob.
+     *
+     * Default 32 ms (~30 Hz). The previous 128 ms default left the
+     * worker idling for up to ~8 frames between iterations, which on
+     * interactive workloads showed up as visible lag between RPC and
+     * visual settle. Apps with low-end CPUs may want to raise it to
+     * reduce idle-loop overhead.
+     */
+    threadUpdaterDelay: 32,
+  };
+
+  /** Coordinates of the first loaded model, used for coordinate system alignment */
+  baseCoordinates: number[] | null = null;
+
+  /** The editor instance for managing model edits and changes */
+  editor: Editor;
+
+  private readonly _connection: FragmentsConnection;
+
+  private _progressCallbacks = new Map<
+    string,
+    (event: LoadProgressEvent) => void
+  >();
+
+  private _isDisposed = false;
+  private _autoRedrawInterval: any = null;
+  private _lastUpdate = 0;
+  private _pendingForcedUpdate: Promise<void> | null = null;
+
+  /**
+   * Creates a new FragmentsModels instance.
+   *
+   * The recommended way to obtain the worker URL is via {@link FragmentsModels.getWorker},
+   * which fetches the version-matched worker from unpkg. See its docs for an example.
+   *
+   * @param workerURL - The URL of the worker script that will handle the fragments processing. If omitted, it falls back to the worker bundled with the package (only works with bundlers that can resolve `new URL("./Worker/worker.mjs", import.meta.url)`).
+   * @param options - Optional configuration.
+   */
+  constructor(workerURL?: string, options?: FragmentsModelsOptions) {
+    const url =
+      workerURL ?? new URL("./Worker/worker.mjs", import.meta.url).href;
+    const requestEvent = this.newRequestEvent();
+    const updateEvent = this.newUpdateEvent();
+    this._connection = new FragmentsConnection(requestEvent, url, {
+      classicWorker: options?.classicWorker,
+      maxWorkers: options?.maxWorkers,
+      threadGroups: options?.threadGroups,
+    });
+    this.editor = new Editor(this, this._connection);
+    this.models = new MeshManager(updateEvent);
+    this.models.list.onItemDeleted.add(() => {
+      if (this.models.list.size !== 0) return;
+      this.baseCoordinates = null;
+    });
+  }
+
+  /**
+   * Effective max worker cap for this instance. Surfaces the value derived
+   * from `navigator.hardwareConcurrency - 3` (floored at 2) or the explicit
+   * `maxWorkers` override passed to the constructor.
+   */
+  get maxWorkers(): number {
+    return this._connection.maxWorkers;
+  }
+
+  /**
+   * Reserved worker capacity per named thread group, as declared at init.
+   * Empty object if no groups were declared.
+   */
+  get threadGroups(): Record<string, number> {
+    return this._connection.threadGroups;
+  }
+
+  /**
+   * Loads a fragments model from an ArrayBuffer.
+   * @param buffer - The ArrayBuffer containing the fragments data to load.
+   * @param options - Configuration options for loading the model.
+   * @param options.modelId - Unique identifier for the model.
+   * @param options.camera - Optional camera to use for model culling and LOD.
+   * @param options.raw - Whether the buffer is raw (uncompressed) or deflated. If omitted, it is auto-detected from the buffer (see {@link isRawBuffer}).
+   * @param options.userData - Optional custom data to attach to the model.
+   * @param options.virtualModelConfig - Optional configuration for virtual model setup.
+   * @returns Promise resolving to the loaded FragmentsModel instance.
+   */
+  async load(
+    buffer: ArrayBuffer | Uint8Array,
+    options: {
+      modelId: string;
+      camera?: THREE.PerspectiveCamera | THREE.OrthographicCamera;
+      raw?: boolean;
+      userData?: Record<string, any>;
+      virtualModelConfig?: VirtualModelConfig;
+      /** Optional callback for receiving loading progress updates. */
+      onProgress?: (event: LoadProgressEvent) => void;
+      /**
+       * Routes the model to a thread group declared at init time. Models
+       * sharing a group also share workers, isolated from other groups and
+       * from the default pool. Throws if the group was not declared.
+       */
+      threadGroup?: string;
+    },
+  ) {
+    // Record the model's group before we issue any worker request so the
+    // pool routing in fragments-connection picks the right thread.
+    this._connection.setModelThreadGroup(options.modelId, options.threadGroup);
+
+    const virtualModelConfig: VirtualModelConfig = {
+      ...options.virtualModelConfig,
+      multithreading: {
+        meshConnectionRate: this.settings.meshConnectionRate,
+        meshConnectionThreshold: this.settings.meshConnectionThreshold,
+        threadUpdaterDelay: this.settings.threadUpdaterDelay,
+        ...options.virtualModelConfig?.multithreading,
+      },
+    };
+
+    const model = new FragmentsModel(
+      options.modelId,
+      this.models,
+      this._connection,
+      this.editor,
+      options.threadGroup,
+    );
+
+    if (options.userData) {
+      model.object.userData = options.userData;
+    }
+
+    // Skip model updates until we have the data set
+    model.frozen = true;
+
+    model.graphicsQuality = this.settings.graphicsQuality;
+
+    if (options.onProgress) {
+      this._progressCallbacks.set(options.modelId, options.onProgress);
+    }
+
+    // Auto-detect compression when the caller did not specify it, so a raw or
+    // deflated buffer both just work. An explicit `raw` always wins.
+    const bytes =
+      buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer);
+    const raw = options.raw ?? isRawBuffer(bytes);
+
+    try {
+      this.models.list.set(model.modelId, model);
+      await model._setup(buffer, raw, virtualModelConfig);
+      if (this.settings.autoCoordinate) {
+        const coordinates = await model.getCoordinates();
+        if (this.baseCoordinates === null) {
+          this.baseCoordinates = coordinates;
+        } else {
+          const [px, py, pz] = coordinates;
+          const [baseX, baseY, baseZ] = this.baseCoordinates;
+          const transform = new THREE.Vector3(
+            baseX - px,
+            baseY - py,
+            baseZ - pz,
+          );
+          model.object.position.add(transform);
+        }
+      }
+    } catch (e) {
+      this._progressCallbacks.delete(options.modelId);
+      // Fully dispose partial state — this tears down the worker thread
+      // (if this was the last model on it), clears transferred materials,
+      // removes the model object from its parent, and deletes it from the
+      // models list. `model.dispose()` is safe on partially-loaded models
+      // because the worker-side `DELETE_MODEL` handler is now idempotent.
+      try {
+        await model.dispose();
+      } catch {
+        // best-effort: if disposal fails, still ensure main-thread cleanup
+        this.models.list.delete(model.modelId);
+      }
+      throw e;
+    } finally {
+      this._progressCallbacks.delete(options.modelId);
+    }
+
+    const { camera } = options;
+
+    if (camera) {
+      model.useCamera(camera);
+    }
+
+    // Model has all the data, so it can start updating
+    model.frozen = false;
+
+    this.onModelLoaded.trigger(model);
+
+    return model;
+  }
+
+  /**
+   * Disposes of all models managed by this FragmentsModels instance.
+   * After calling this method, the FragmentsModels instance should not be used anymore.
+   */
+  async dispose() {
+    this._isDisposed = true;
+    if (this._autoRedrawInterval) {
+      clearTimeout(this._autoRedrawInterval);
+      this._autoRedrawInterval = null;
+    }
+    const models = Array.from(this.models.list.values());
+    const promises = [];
+    for (const model of models) {
+      promises.push(model.dispose());
+    }
+    await Promise.all(promises);
+    this.onModelLoaded.reset();
+  }
+
+  /**
+   * Disposes of a specific model by its ID.
+   * @param modelId - The unique identifier of the model to dispose.
+   */
+  async disposeModel(modelId: string) {
+    const model = this.models.list.get(modelId);
+    if (model) {
+      await model.dispose();
+    }
+  }
+
+  /**
+   * Aborts an in-flight `load()` for the given model ID. The pending `load()`
+   * promise will reject with a `LoadAbortedError` and any partial state
+   * (on both the main thread and the worker) is disposed.
+   *
+   * Has no effect if the model finished loading or isn't currently loading.
+   *
+   * @param modelId - The unique identifier of the model to abort.
+   */
+  abort(modelId: string) {
+    // Fire-and-forget — the worker sets an abort flag and the in-flight
+    // generate() loop throws at its next yield point. The error unwinds
+    // through load() and its catch block cleans up on the main thread.
+    this._connection.fetch({
+      class: MultiThreadingRequestClass.ABORT_MODEL,
+      modelId,
+    });
+  }
+
+  /**
+   * Updates all models managed by this FragmentsModels instance.
+   * @param force - If true, it will force all the models to finish all the pending requests.
+   */
+  async update(force = false) {
+    if (this._isDisposed) {
+      return;
+    }
+    const now = performance.now();
+    const elapsed = now - this._lastUpdate;
+    if (elapsed < this.settings.maxUpdateRate) {
+      if (!force) {
+        // Keep the poll alive: view changes are detected by these
+        // periodic checks, so a throttled call must still leave a
+        // scheduled one behind. Cheap — no worker traffic happens
+        // until a view actually changes.
+        this.scheduleNextUpdate();
+        return;
+      }
+      // Forced updates must not be dropped (callers await them as a
+      // fence), but they must not bypass the rate limit either: camera
+      // controls emit "rest" — and the components layer forces an
+      // update on it — on nearly every frame of a programmatic orbit,
+      // and each forced refresh is a full re-cull plus an unbounded
+      // drain on the main thread. Coalesce every forced call inside
+      // the window into one trailing forced update; awaiting callers
+      // are released when that one has settled, which covers all the
+      // RPCs they could have been waiting for.
+      if (!this._pendingForcedUpdate) {
+        const delay = this.settings.maxUpdateRate - elapsed + 1;
+        this._pendingForcedUpdate = new Promise<void>((resolve) => {
+          setTimeout(() => {
+            this._pendingForcedUpdate = null;
+            this.performUpdate(true).then(resolve, () => resolve());
+          }, delay);
+        });
+      }
+      return this._pendingForcedUpdate;
+    }
+    return this.performUpdate(force);
+  }
+
+  private async performUpdate(force: boolean) {
+    if (this._isDisposed) {
+      return;
+    }
+    this._lastUpdate = performance.now();
+
+    // Update the virtual view for all models. Unforced refreshes are
+    // skipped per model when its view is unchanged (no RPC at all);
+    // forced ones always dispatch because their FINISH acts as the
+    // completion fence for forceUpdateFinish below.
+    const modelUpdates: Promise<void>[] = [];
+    for (const model of this.models.list.values()) {
+      modelUpdates.push(model._refreshView(force));
+    }
+    await Promise.all(modelUpdates);
+
+    if (force) {
+      // Sequence-fence based: resolves precisely when every RPC
+      // dispatched up to this call has had its effects flushed to
+      // main and applied. No polling, no buffer.
+      await this.models.forceUpdateFinish();
+    } else {
+      this.models.update();
+    }
+    this.scheduleNextUpdate();
+  }
+
+  /**
+   * (Re)schedules the next automatic update. The view-change gating
+   * means an idle scene produces no worker messages and thus no
+   * FINISH-driven update events, so the loop sustains itself with
+   * this timer instead. Skipped when disposed or no models exist —
+   * the next model load (or any mesh update event) restarts it.
+   */
+  private scheduleNextUpdate() {
+    if (this._isDisposed || this.models.list.size === 0) {
+      return;
+    }
+    if (this._autoRedrawInterval) {
+      clearTimeout(this._autoRedrawInterval);
+    }
+    const offset = this.settings.maxUpdateRate + 1;
+    this._autoRedrawInterval = setTimeout(() => {
+      this._autoRedrawInterval = null;
+      this.update();
+    }, offset);
+  }
+
+  private async manageRequest(message: any): Promise<void> {
+    if (message.class === MultiThreadingRequestClass.LOAD_PROGRESS) {
+      const callback = this._progressCallbacks.get(message.modelId);
+      if (callback) {
+        callback({
+          modelId: message.modelId,
+          stage: message.stage,
+          progress: message.progress,
+        });
+      }
+      return;
+    }
+    const model = this.models.list.get(message.modelId);
+    if (model) {
+      await model.handleRequest(message);
+    }
+  }
+
+  private newUpdateEvent() {
+    return () => {
+      // This limits the maximum update rate to the maxUpdateRate setting
+      if (this._autoRedrawInterval) {
+        clearTimeout(this._autoRedrawInterval);
+      }
+
+      const offset = this.settings.maxUpdateRate + 1;
+      this._autoRedrawInterval = setTimeout(() => {
+        this.update();
+      }, offset);
+    };
+  }
+
+  private newRequestEvent() {
+    return (request: ThreadHandler) => {
+      this.manageRequest(request);
+    };
+  }
+}

@@ -1,0 +1,887 @@
+import { ByteBuffer } from "flatbuffers";
+import * as THREE from "three";
+
+import pako from "pako";
+
+// eslint-disable-next-line import/no-extraneous-dependencies
+import {
+  acceleratedRaycast,
+  computeBoundsTree,
+  disposeBoundsTree,
+} from "three-mesh-bvh";
+
+import {
+  AttributesUniqueValuesParams,
+  CurrentLod,
+  Identifier,
+  IndexArrayType,
+  IndexEntry,
+  IndexInfo,
+  ItemInformationType,
+  ItemSelectionType,
+  ItemsQueryConfig,
+  ItemsQueryParams,
+  LodMode,
+  MaterialDefinition,
+  MeshData,
+  SnappingClass,
+  VirtualModelConfig,
+} from "../model/model-types";
+import {
+  AlignmentsController,
+  ItemConfigController,
+  RaycastController,
+  VirtualIndexesController,
+  VirtualMaterialController,
+  VirtualPropertiesController,
+  VirtualTilesController,
+} from "./virtual-controllers";
+
+import { VirtualBoxController } from "../bounding-boxes";
+
+import { Model } from "../../../Schema";
+import { Connection } from "../multithreading/connection";
+
+import { EditRequest, EditRequestType, EditUtils } from "../../../Utils";
+import { GridsController } from "./virtual-controllers/grids-controller";
+import {
+  CoordinatesHelper,
+  GeometryHelper,
+  HighlightHelper,
+  ItemsHelper,
+  RaycastHelper,
+  SectionHelper,
+  SequenceHelper,
+  VisibilityHelper,
+} from "./virtual-helpers";
+import { TileData } from "./virtual-meshes";
+import { EditRequestIndex } from "./edit-request-index";
+
+export class VirtualFragmentsModel {
+  data: Model;
+  view: any;
+  raycaster: RaycastController;
+  itemConfig: ItemConfigController;
+  properties: VirtualPropertiesController;
+  materials: VirtualMaterialController;
+  tiles: VirtualTilesController;
+  boxes: VirtualBoxController;
+  indexes: VirtualIndexesController;
+
+  requests: EditRequest[] = [];
+
+  private _requestIndex = new EditRequestIndex();
+
+  private _raycastHelper = new RaycastHelper();
+  private _coordinatesHelper = new CoordinatesHelper();
+  private _highlightHelper = new HighlightHelper();
+  private _visibilityHelper = new VisibilityHelper();
+  private _geometryHelper = new GeometryHelper();
+  private _sectionHelper = new SectionHelper();
+  private _itemsHelper = new ItemsHelper();
+  private _sequenceHelper = new SequenceHelper(this);
+
+  private _config: VirtualModelConfig = {};
+  private _modelId: string;
+
+  private _alignments: AlignmentsController;
+  private _grids: GridsController;
+  private _connection: Connection;
+
+  private _reprIdMap = new Map<number, number>();
+  private _nextId = 0;
+
+  private _requestsForRedo: EditRequest[] = [];
+
+  constructor(
+    modelId: string,
+    data: ArrayBuffer,
+    connection: Connection,
+    config?: VirtualModelConfig,
+  ) {
+    this._modelId = modelId;
+    this._connection = connection;
+    this._config = { ...this._config, ...config };
+    this.data = this.setupModel(data);
+    this.boxes = new VirtualBoxController(this.data);
+    this.materials = this.setupMaterials(modelId);
+    this._alignments = new AlignmentsController(this);
+    this._grids = new GridsController(this);
+    this.itemConfig = this.setupItemsConfig();
+    this.tiles = this.setupTiles();
+    this.properties = this.setupProperties();
+    this.raycaster = this.setupRaycaster();
+    this.indexes = new VirtualIndexesController(this);
+    this.setupBVH();
+    this._nextId = this.getMaxLocalId();
+  }
+
+  // ---------------------------------------------------------------------------
+  // User-defined indexes (see ModelIndex schema)
+  // ---------------------------------------------------------------------------
+
+  getIndexNames(): string[] {
+    return this.indexes.getNames();
+  }
+
+  getIndexInfo(name: string): IndexInfo | null {
+    return this.indexes.getInfo(name);
+  }
+
+  getIndexKeys<K extends string | number>(
+    name: string,
+  ): IndexArrayType<K> | null {
+    return this.indexes.getKeys(name) as IndexArrayType<K> | null;
+  }
+
+  getIndexKey<K extends string | number>(
+    name: string,
+    index: number,
+  ): K | null {
+    return this.indexes.getKey(name, index) as K | null;
+  }
+
+  getIndexValues<V extends string | number>(name: string): V[] | null {
+    return this.indexes.getValues(name) as V[] | null;
+  }
+
+  hasIndexEntry<K extends string | number>(name: string, key: K): boolean {
+    return this.indexes.has(name, key);
+  }
+
+  getIndexEntry<K extends string | number, V extends IndexEntry>(
+    name: string,
+    key: K,
+  ): V | null {
+    return this.indexes.getEntry(name, key) as V | null;
+  }
+
+  getInverseIndexEntry<K extends string | number, V extends string | number>(
+    name: string,
+    value: K,
+  ): IndexArrayType<V> | null {
+    return this.indexes.getInverseEntry(
+      name,
+      value,
+    ) as IndexArrayType<V> | null;
+  }
+
+  getItemsByConfig(condition: (item: number) => boolean) {
+    return this._itemsHelper.getItemsByConfig(this, condition);
+  }
+
+  getItemsCategories(ids: number[]) {
+    return this.properties.getItemsCategories(ids);
+  }
+
+  getItemIdsByLocalIds(localIds: number[]) {
+    return this.properties.getItemIdsFromLocalIds(localIds);
+  }
+
+  getItemAttributes(id: number) {
+    return this.properties.getItemAttributes(id);
+  }
+
+  // getItemsAttributes(ids: number[]) {
+  //   return this.properties.getItemsAttributes(ids);
+  // }
+
+  getAttributesUniqueValues(config: AttributesUniqueValuesParams[]) {
+    return this.properties.getAttributesUniqueValues(config);
+  }
+
+  getItemsData(ids: number[], config: any) {
+    return this.properties.getItemsData(ids, config);
+  }
+
+  getItemsOfCategories(categories: RegExp[]) {
+    return this.properties.getItemsOfCategories(categories);
+  }
+
+  getItemsWithGeometry() {
+    return this.properties.getItemsWithGeometry();
+  }
+
+  getItemsWithGeometryCategories() {
+    return this.properties.getItemsWithGeometryCategories();
+  }
+
+  getItemsByQuery(params: ItemsQueryParams, config?: ItemsQueryConfig) {
+    return this.properties.getItemsByQuery(params, config);
+  }
+
+  getItemRelations(id: number) {
+    return this.properties.getItemRelations(id);
+  }
+
+  getSpatialStructure() {
+    // If there are any changes to the spatial structure, return the changed spatial structure
+    const found = EditUtils.applyChangesToSpecialData(
+      this.requests,
+      "SPATIAL_STRUCTURE",
+    );
+    if (found) {
+      return found;
+    }
+    return this.properties.getSpatialStructure();
+  }
+
+  getMaxLocalId() {
+    return this.properties.getMaxLocalId();
+  }
+
+  getCategories() {
+    return this.properties.getCategories();
+  }
+
+  getMetadata() {
+    // If there are any changes to the metadata, return the changed metadata
+    const found = EditUtils.applyChangesToSpecialData(
+      this.requests,
+      "METADATA",
+    );
+    if (found) {
+      return found;
+    }
+
+    // Otherwise, return the original metadata
+    return this.properties.getMetadata();
+  }
+
+  getCRS() {
+    // If there are any changes to the metadata, check there too
+    const found = EditUtils.applyChangesToSpecialData(
+      this.requests,
+      "METADATA",
+    );
+    if (found && found.crs) {
+      return found.crs;
+    }
+
+    return this.properties.getCRS();
+  }
+
+  getLocalIdsByGuids(guids: string[]) {
+    return this.properties.getLocalIdsByGuids(guids);
+  }
+
+  getGuidsByLocalIds(localIds: number[]) {
+    return this.properties.getGuidsByLocalIds(localIds);
+  }
+
+  /**
+   * Returns the user-facing `localId` for each internal `itemId`,
+   * preserving order. Used by GPU-readback pickers that recover item
+   * ids from the per-vertex `id` attribute and need to translate to
+   * the public id space.
+   */
+  getLocalIdsFromItemIds(itemIds: Iterable<number>) {
+    return this.properties.getLocalIdsFromItemIds(itemIds);
+  }
+
+  getSequenced(
+    result: ItemInformationType,
+    fromItems: ItemSelectionType[],
+    inputs?: {
+      selector?: Partial<Record<ItemSelectionType, any>>;
+      result?: any;
+    },
+  ) {
+    return this._sequenceHelper.getSequenced(result, fromItems, inputs);
+  }
+
+  highlight(items: number[], highlightMaterial: MaterialDefinition) {
+    this._highlightHelper.highlight(this, items, highlightMaterial);
+  }
+
+  setColor(items: number[], color: MaterialDefinition["color"]) {
+    this._highlightHelper.setColor(this, items, color);
+  }
+
+  resetColor(items: number[]) {
+    this._highlightHelper.resetColor(this, items);
+  }
+
+  setOpacity(items: number[], opacity: number) {
+    this._highlightHelper.setOpacity(this, items, opacity);
+  }
+
+  resetOpacity(items: number[]) {
+    this._highlightHelper.resetOpacity(this, items);
+  }
+
+  getHighlight(localIds: number[]) {
+    return this._highlightHelper.getHighlight(this, localIds);
+  }
+
+  getHighlightItemIds() {
+    return this._highlightHelper.getHighlightItems(this);
+  }
+
+  resetHighlight(items: number[]) {
+    this._highlightHelper.resetHighlight(this, items);
+  }
+
+  /**
+   * For every loaded tile that contains at least one of the given local
+   * ids, returns the index-buffer chunks those items occupy in the tile.
+   * Used to draw outline silhouettes by sharing the tile's geometry
+   * attributes and limiting drawing to the returned chunks via
+   * `geometry.groups`.
+   *
+   * @returns One entry per affected tile. Each entry has parallel
+   *   `position` and `size` Uint32Arrays giving start index and count.
+   */
+  getItemDrawChunks(localIds: Iterable<number>) {
+    const itemIds = this.properties.getItemIdsFromLocalIds(localIds);
+    return this.tiles.getDrawChunksForItems(new Set(itemIds));
+  }
+
+  getCoordinates() {
+    return this._coordinatesHelper.getCoordinates(this);
+  }
+
+  getPositions(localIds?: number[]) {
+    return this._coordinatesHelper.getPositions(this, localIds);
+  }
+
+  getGeometriesLength(): number {
+    return this._geometryHelper.getGeometriesLength(this);
+  }
+
+  getGuids() {
+    return this.properties.getGuids();
+  }
+
+  getLocalIds() {
+    return this.properties.getLocalIds();
+  }
+
+  getItemsGeometry(localIds: number[], lod = CurrentLod.GEOMETRY) {
+    const indices = this.properties.getItemIdsFromLocalIds(localIds);
+    const geometries: MeshData[][] = [];
+    for (const index of indices) {
+      const geometry = this._geometryHelper.getSampleGeometry(this, index, lod);
+      geometries.push(geometry);
+    }
+    return geometries;
+  }
+
+  getGeometries(reprsLocalIds: number[]) {
+    if (this._reprIdMap.size === 0) {
+      const meshes = this.data.meshes()!;
+      for (let i = 0; i < meshes.representationsLength(); i++) {
+        const localId = meshes.representationIds(i)!;
+        this._reprIdMap.set(localId, i);
+      }
+    }
+
+    const indices = new Map<number, number>();
+    for (const localId of reprsLocalIds) {
+      if (this._reprIdMap.has(localId)) {
+        indices.set(localId, this._reprIdMap.get(localId)!);
+      }
+    }
+
+    const meshes = this.data.meshes()!;
+
+    const reprsIndices = Array.from(indices.values());
+
+    const result: MeshData[] = [];
+    for (const index of reprsIndices) {
+      const geoms = this.tiles.fetchGeometry(index) as TileData | TileData[];
+      const items = Array.isArray(geoms) ? geoms : [geoms];
+      for (const found of items) {
+        const indices = found.indexBuffer as Uint16Array;
+        const positions = found.positionBuffer as Float32Array;
+        const normals = found.normalBuffer as Int16Array;
+        const representationId = meshes.representationIds(index)!;
+        result.push({
+          transform: new THREE.Matrix4(),
+          indices,
+          positions,
+          normals,
+          representationId,
+        });
+      }
+    }
+
+    return result;
+  }
+
+  getItemsVolume(localIds: number[]) {
+    const indices = this.properties.getItemIdsFromLocalIds(localIds);
+    let volume: number = 0;
+    for (const index of indices) {
+      volume += this._geometryHelper.getVolume(this, index);
+    }
+    return volume;
+  }
+
+  getAttributeNames() {
+    const names = this.properties.getAttributeNames();
+    return names;
+  }
+
+  getAttributeValues() {
+    const values = this.properties.getAttributeValues();
+    return values;
+  }
+
+  getAttributeTypes() {
+    const types = this.properties.getAttributeTypes();
+    return types;
+  }
+
+  getRelationNames() {
+    const names = this.properties.getRelationNames();
+    return names;
+  }
+
+  getItemsMaterialDefinition(localIds: number[]) {
+    const indices = this.properties.getItemIdsFromLocalIds(localIds);
+    return this.materials.getItemsMaterialDefinition(
+      this.data,
+      indices,
+      localIds,
+    );
+  }
+
+  resetVisible() {
+    this._visibilityHelper.resetVisible(this);
+  }
+
+  getItemsByVisibility(visible: boolean) {
+    return this._visibilityHelper.getItemsByVisibility(this, visible);
+  }
+
+  raycast(ray: THREE.Ray, frustum: THREE.Frustum, returnAll?: boolean): any {
+    return this._raycastHelper.raycast(this, ray, frustum, returnAll);
+  }
+
+  snapRaycast(
+    ray: THREE.Ray,
+    frustum: THREE.Frustum,
+    snaps: SnappingClass[],
+  ): any[] {
+    return this._raycastHelper.snapRaycast(this, ray, frustum, snaps);
+  }
+
+  rectangleRaycast(frustum: THREE.Frustum, fullyIncluded: boolean): number[] {
+    return this._raycastHelper.rectangleRaycast(this, frustum, fullyIncluded);
+  }
+
+  getSection(plane: THREE.Plane, localIds?: number[]) {
+    const indices = this.properties.getItemIdsFromLocalIds(localIds);
+    return this._sectionHelper.getSection(this, plane, indices);
+  }
+
+  getAlignments() {
+    return this._alignments.getAlignments();
+  }
+
+  getGrids() {
+    return this._grids.getGrids();
+  }
+
+  getBuffer(raw: boolean) {
+    const bb = this.data.bb as ByteBuffer;
+    const bytes = bb.bytes();
+    const buffer = bytes.buffer;
+    return raw ? buffer : pako.deflate(buffer as ArrayBuffer);
+  }
+
+  getSubsetBuffer(localIds: number[], raw: boolean) {
+    // Build localId -> item index map
+    const localIdToIndex = new Map<number, number>();
+    for (let i = 0; i < this.data.localIdsLength(); i++) {
+      localIdToIndex.set(this.data.localIds(i)!, i);
+    }
+
+    // Get item indices for the requested localIds
+    const itemIndices = new Set<number>();
+    for (const localId of localIds) {
+      const index = localIdToIndex.get(localId);
+      if (index !== undefined) {
+        itemIndices.add(index);
+      }
+    }
+
+    // Fetch real item data using existing utility
+    const items = EditUtils.getItems(this.data, itemIndices);
+
+    // Build UPDATE_ITEM requests with the real data so that
+    // getIdsDelta includes these items and all their associated geometry
+    const requests: EditRequest[] = [];
+    for (const [localId, itemData] of items) {
+      requests.push({
+        type: EditRequestType.UPDATE_ITEM,
+        localId,
+        data: itemData,
+      });
+    }
+
+    // Generate a delta model containing only these items + their geometry
+    const { model } = EditUtils.edit(this.data, requests, {
+      raw,
+      delta: true,
+    });
+
+    return model;
+  }
+
+  dispose() {
+    this.tiles.dispose();
+  }
+
+  setVisible(localIds: number[], visible: boolean) {
+    this._visibilityHelper.setVisible(this, localIds, visible);
+  }
+
+  toggleVisible(localIds: number[]) {
+    this._visibilityHelper.toggleVisible(this, localIds);
+  }
+
+  getVisible(items: number[]) {
+    return this._visibilityHelper.getVisible(this, items);
+  }
+
+  hideForEdit(localIds: number[]) {
+    this._visibilityHelper.hideForEdit(this, localIds);
+  }
+
+  clearHiddenForEdit() {
+    this._visibilityHelper.clearHiddenForEdit();
+  }
+
+  getItemsChildren(ids: Identifier[]) {
+    return this.properties.getItemsChildren(ids);
+  }
+
+  async setupData(
+    onProgress?: (progress: number) => void,
+    throwIfAborted?: () => void,
+  ) {
+    await this.tiles.generate(onProgress, throwIfAborted);
+  }
+
+  refreshView(view: any) {
+    this.view = view;
+    this.tiles.setupView(view);
+  }
+
+  getFullBBox() {
+    return this.boxes.fullBox;
+  }
+
+  getBBoxes(items: number[]) {
+    const box = new THREE.Box3();
+    this.properties.getBox(items, box);
+    return box;
+  }
+
+  traverse(itemIds: number[], onItem: (itemId: number, index: number) => void) {
+    this._itemsHelper.traverse(this, itemIds, onItem);
+  }
+
+  update(time: number): boolean {
+    this.tiles.update(time);
+    return this.tiles.tilesUpdated;
+  }
+
+  /**
+   * Per-localId lookup over the pending requests, used by the property reads
+   * instead of scanning the whole requests list per item.
+   */
+  get requestIndex() {
+    this._requestIndex.sync(this.requests);
+    return this._requestIndex;
+  }
+
+  edit(requests: EditRequest[], raw = true) {
+    const ids = EditUtils.solveIds(requests, this._nextId);
+    this._nextId += ids.length;
+    for (const request of requests) {
+      this.requests.push(request);
+      this._requestIndex.push(request);
+    }
+    const { model, items } = EditUtils.edit(this.data, this.requests, {
+      raw,
+      delta: true,
+    });
+    // Clear the previous hidden-for-edit set before applying the new one.
+    // Each edit() rebuilds the delta from all current requests, so `items`
+    // is the complete set of edited items — old entries must not persist.
+    this._visibilityHelper.clearHiddenForEdit();
+    this._visibilityHelper.hideForEdit(this, items);
+    return { deltaModelBuffer: model, ids };
+  }
+
+  reset() {
+    this.requests = [];
+    this._requestsForRedo = [];
+    this._requestIndex.rebuild(this.requests);
+    this._nextId = this.getMaxLocalId();
+  }
+
+  save(raw = true) {
+    const request: EditRequest = {
+      type: EditRequestType.UPDATE_MAX_LOCAL_ID,
+      localId: this._nextId,
+    };
+    this.requests.push(request);
+    this._requestIndex.push(request);
+    const { model } = EditUtils.edit(this.data, this.requests, {
+      raw,
+      delta: false,
+    });
+    return model;
+  }
+
+  undo() {
+    if (this.requests.length === 0) {
+      return;
+    }
+    const lastRequest = this.requests.pop();
+    if (!lastRequest) {
+      return;
+    }
+    this._requestIndex.pop(lastRequest);
+    this._requestsForRedo.unshift(lastRequest);
+  }
+
+  redo() {
+    if (this._requestsForRedo.length === 0) {
+      return;
+    }
+    const lastUndoneRequest = this._requestsForRedo.shift();
+    if (!lastUndoneRequest) {
+      return;
+    }
+    this.requests.push(lastUndoneRequest);
+    this._requestIndex.push(lastUndoneRequest);
+  }
+
+  getRequests() {
+    return {
+      requests: this.requests,
+      undoneRequests: this._requestsForRedo,
+    };
+  }
+
+  setRequests(data: {
+    requests?: EditRequest[];
+    undoneRequests?: EditRequest[];
+  }) {
+    if (data.requests) {
+      this.requests = data.requests;
+      this._requestIndex.rebuild(this.requests);
+    }
+    if (data.undoneRequests) {
+      this._requestsForRedo = data.undoneRequests;
+    }
+  }
+
+  selectRequest(index: number) {
+    const allRequests: EditRequest[] = [];
+    for (const request of this.requests) {
+      allRequests.push(request);
+    }
+    for (const request of this._requestsForRedo) {
+      allRequests.push(request);
+    }
+
+    this.requests = [];
+    this._requestsForRedo = [];
+
+    for (let i = 0; i < allRequests.length; i++) {
+      if (i <= index) {
+        this.requests.push(allRequests[i]);
+      } else {
+        this._requestsForRedo.push(allRequests[i]);
+      }
+    }
+    this._requestIndex.rebuild(this.requests);
+  }
+
+  getMaterialsIds() {
+    const ids = EditUtils.getMaterialsIds(this.data);
+    return EditUtils.applyChangesToIds(this.requests, ids, "MATERIAL", true);
+  }
+
+  getMaterials(ids?: Iterable<number>) {
+    const found = EditUtils.getMaterials(this.data, ids);
+    EditUtils.applyChangesToRawData(this.requests, found, "MATERIAL");
+    return found;
+  }
+
+  getRepresentationsIds() {
+    const ids = EditUtils.getRepresentationsIds(this.data);
+    return EditUtils.applyChangesToIds(
+      this.requests,
+      ids,
+      "REPRESENTATION",
+      true,
+    );
+  }
+
+  getRepresentations(ids?: Iterable<number>) {
+    const found = EditUtils.getRepresentations(this.data, ids);
+    EditUtils.applyChangesToRawData(this.requests, found, "REPRESENTATION");
+    return found;
+  }
+
+  getLocalTransformsIds() {
+    const ids = EditUtils.getLocalTransformsIds(this.data);
+    return EditUtils.applyChangesToIds(
+      this.requests,
+      ids,
+      "LOCAL_TRANSFORM",
+      true,
+    );
+  }
+
+  getLocalTransforms(ids?: Iterable<number>) {
+    const found = EditUtils.getLocalTransforms(this.data, ids);
+    EditUtils.applyChangesToRawData(this.requests, found, "LOCAL_TRANSFORM");
+    return found;
+  }
+
+  getGlobalTransformsIds() {
+    const ids = EditUtils.getGlobalTransformsIds(this.data);
+    return EditUtils.applyChangesToIds(
+      this.requests,
+      ids,
+      "GLOBAL_TRANSFORM",
+      true,
+    );
+  }
+
+  getGlobalTransforms(ids?: Iterable<number>) {
+    const found = EditUtils.getGlobalTransforms(this.data, ids);
+    EditUtils.applyChangesToRawData(this.requests, found, "GLOBAL_TRANSFORM");
+    return found;
+  }
+
+  getSamplesIds() {
+    const ids = EditUtils.getSamplesIds(this.data);
+    return EditUtils.applyChangesToIds(this.requests, ids, "SAMPLE", true);
+  }
+
+  getSamples(ids?: Iterable<number>) {
+    const result = EditUtils.getSamples(this.data, ids);
+    EditUtils.applyChangesToRawData(this.requests, result, "SAMPLE");
+    return result;
+  }
+
+  getItemsIds() {
+    const ids = EditUtils.getItemsIds(this.data);
+    return EditUtils.applyChangesToIds(this.requests, ids, "ITEM", true);
+  }
+
+  getItems(ids?: Iterable<number>) {
+    const itemIds = this.properties.getItemIdsFromLocalIds(ids);
+    const found = EditUtils.getItems(this.data, itemIds);
+    const filter = ids ? new Set(ids) : undefined;
+    EditUtils.applyChangesToRawData(this.requests, found, "ITEM", filter);
+    return found;
+  }
+
+  getRelations(ids?: number[]) {
+    const found = this.properties.getRawRelations(ids);
+    EditUtils.applyChangesToRawData(this.requests, found, "RELATION");
+    return found;
+  }
+
+  getGlobalTranformsIdsOfItems(ids: number[]) {
+    return EditUtils.getGlobalTranformsIdsOfItems(this.data, ids);
+  }
+
+  getElementsData(ids: Iterable<number>) {
+    const filtered = new Set(ids);
+    EditUtils.applyChangesToIds(this.requests, filtered, "ITEM", false);
+    return EditUtils.getElementsData(this, filtered);
+  }
+
+  /**
+   * Fast snap-only data fetch keyed by **itemId** (the FlatBuffer's
+   * `sample.item()` index). See `EditUtils.getItemSnapData` for the
+   * rationale; in short, it uses `boxes.sampleOf(itemId)` for an O(1)
+   * sample lookup instead of walking the full sample table.
+   */
+  getItemSnapData(itemId: number) {
+    return EditUtils.getItemSnapData(this, itemId);
+  }
+
+  setLodMode(lodMode: LodMode) {
+    this.tiles.setLodMode(lodMode);
+  }
+
+  private setupBVH() {
+    // @ts-ignore
+    THREE.BufferGeometry.prototype.computeBoundsTree = computeBoundsTree;
+    // @ts-ignore
+    THREE.BufferGeometry.prototype.disposeBoundsTree = disposeBoundsTree;
+    // @ts-ignore
+    THREE.Mesh.prototype.raycast = acceleratedRaycast;
+  }
+
+  private setupProperties() {
+    return new VirtualPropertiesController(
+      this,
+      this.boxes,
+      this._config.properties,
+    );
+  }
+
+  private setupRaycaster() {
+    return new RaycastController(
+      this.data,
+      this.boxes,
+      this.tiles,
+      this.itemConfig,
+    );
+  }
+
+  private setupMaterials(modelId: string) {
+    return new VirtualMaterialController(modelId, this._onTransferMaterial);
+  }
+
+  private setupTiles() {
+    const materials = this.materials.update(this.data);
+    return new VirtualTilesController({
+      modelId: this._modelId,
+      connection: this._connection,
+      multithreading: this._config.multithreading,
+      model: this.data,
+      boxes: this.boxes,
+      items: this.itemConfig,
+      materials,
+    });
+  }
+
+  private setupModel(data: ArrayBuffer) {
+    const uintArray = new Uint8Array(data);
+    const byteBuffer = new ByteBuffer(uintArray);
+    return Model.getRootAsModel(byteBuffer);
+  }
+
+  private _onTransferMaterial = (data: any, trans: any) => {
+    if (!this._connection) return undefined;
+    return this._connection.fetch(data, trans);
+  };
+
+  private setupItemsConfig() {
+    // itemConfig is addressed by itemId (an index into meshes_items), which
+    // is what getItemIdsFromLocalIds returns and what every setVisible /
+    // setHighlight call writes. Sizing it by localIdsLength instead mixed two
+    // id spaces: items without geometry have no itemId at all, so the tail of
+    // the buffer was never written and stayed flagged visible, and querying it
+    // handed those out-of-range ids to getLocalIdsFromItemIds, which read past
+    // the end of meshes_items (flatbuffers don't bounds check) and decoded
+    // junk into real localIds.
+    const meshes = this.data.meshes();
+    const itemsCount = meshes ? meshes.meshesItemsLength() : 0;
+    return new ItemConfigController(itemsCount);
+  }
+}
