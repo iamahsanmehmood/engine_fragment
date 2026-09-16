@@ -136,6 +136,17 @@ export class VirtualTilesController {
   private _changedSamples = 0;
   private _virtualView: any;
 
+  /**
+   * Per-sample frustum verdict from the spatial hierarchy, refreshed on
+   * every real view change: 1 = the sample's box is provably outside
+   * the frustum/clipping planes (skip all per-sample plane math in
+   * {@link fetchLodLevel}), 0 = candidate (run the exact per-sample
+   * test as before, so the final classification is unchanged). All
+   * zeroes when no view or lookup exists — the pass then behaves
+   * exactly like the flat version.
+   */
+  private _outsideMask: Uint8Array;
+
   private _lodMode = LodMode.DEFAULT;
 
   constructor(data: VirtualTileData) {
@@ -155,6 +166,7 @@ export class VirtualTilesController {
     this._sampleLodClass = new Uint8Array(this._sampleAmount);
     this._sampleLodState = new Uint8Array(this._sampleAmount);
     this._sampleLodSize = new Float32Array(this._sampleAmount);
+    this._outsideMask = new Uint8Array(this._sampleAmount);
     this._tileDimension = this.computeTileSize();
     this._tileBySample = new Array(this._sampleAmount);
     this._lodBySample = new Array(this._sampleAmount);
@@ -195,8 +207,16 @@ export class VirtualTilesController {
       mesh.setupTemplates();
     }
     const step = Math.max(1, Math.floor(this._sampleAmount / 20));
+    // Fill tiles in descending sample-dimension order (the same order the
+    // cull sweep uses) instead of file order. A tile's index buffer is
+    // laid out in insertion order and the per-sample LOD decision is
+    // driven by screen size, so with size-sorted samples the geometry /
+    // wires / invisible cut through a tile becomes one or two contiguous
+    // runs instead of dozens of interleaved ones — and every visible run
+    // is a separate `geometry.groups` entry, i.e. a separate draw call on
+    // the main thread. Tile membership itself is unchanged.
     for (let i = 0; i < this._sampleAmount; i++) {
-      this.generateSampleInTiles(i);
+      this.generateSampleInTiles(this._samplesDimensions[i]);
       if (i % step === 0) {
         onProgress?.(i / this._sampleAmount);
         // Yield the worker thread so progress messages get dispatched
@@ -209,12 +229,47 @@ export class VirtualTilesController {
   }
 
   setupView(view: any) {
+    const previous = this._virtualView;
     this._virtualView = view;
     VirtualMemoryController.setCapacity(view.meshThreshold);
+    if (previous && this.viewEquals(previous, view)) {
+      // Same view as before (typically a forced update used as a
+      // completion fence): adopt the new view object (it may carry a
+      // fresh graphicThreshold) but skip the full re-cull. If the
+      // previous pass already finished, emit a FINISH directly so
+      // main-side `forceUpdateFinish` fences settle; if a pass is
+      // still running, its natural FINISH will carry this RPC's seq
+      // because the stamp is read at emission time.
+      this.setupViewPlanes();
+      if (this.tilesUpdated) {
+        this.emitFinish();
+      }
+      return;
+    }
     this.restart();
     this.updateOrientationIfNeeded();
     this.updatePositionIfNeeded();
     this.setupViewPlanes();
+    this.updateOutsideMask();
+  }
+
+  /**
+   * Rebuilds {@link _outsideMask} from the spatial hierarchy for the
+   * current view. One hierarchy walk per view change replaces the
+   * per-sample plane tests for everything that is provably outside —
+   * with a zoomed-in camera that is typically most of the model. Falls
+   * back to all-candidates (no skipping) when the model has no lookup
+   * (empty model) or no view yet.
+   */
+  private updateOutsideMask() {
+    const lookup = this._boxes.lookup;
+    const frustum = this._virtualView?.cameraFrustum;
+    if (!lookup || !frustum) {
+      this._outsideMask.fill(0);
+      return;
+    }
+    const clipping = this._virtualView.clippingPlanes ?? [];
+    lookup.fillOutsideFrustumMask(clipping, frustum, this._outsideMask);
   }
 
   updateVirtualMeshes(itemIds: number[]) {
@@ -414,6 +469,11 @@ export class VirtualTilesController {
     if (!updateFinished) {
       return;
     }
+    this.emitFinish();
+    this.tilesUpdated = true;
+  }
+
+  private emitFinish() {
     this._meshConnection.process({
       tileRequestClass: TileRequestClass.FINISH,
       modelId: this._modelId,
@@ -426,7 +486,53 @@ export class VirtualTilesController {
       // waiters precisely, no buffer / poll required.
       seq: thread.lastSeenSeq,
     });
-    this.tilesUpdated = true;
+  }
+
+  /**
+   * Structural equality of two worker-side views, covering every field
+   * the culling/LOD pass reads. `graphicThreshold` is deliberately
+   * ignored — it only budgets the invisible-tile cache, so a change in
+   * it must not trigger a full re-cull (the new value still takes
+   * effect because the caller stores the incoming view first).
+   */
+  private viewEquals(a: any, b: any): boolean {
+    if (
+      a.fov !== b.fov ||
+      a.orthogonalDimension !== b.orthogonalDimension ||
+      a.viewSize !== b.viewSize ||
+      a.graphicQuality !== b.graphicQuality
+    ) {
+      return false;
+    }
+    if (!this.vectorEquals(a.cameraPosition, b.cameraPosition)) {
+      return false;
+    }
+    const aPlanes = a.cameraFrustum.planes;
+    const bPlanes = b.cameraFrustum.planes;
+    for (let i = 0; i < aPlanes.length; i++) {
+      if (!this.planeEquals(aPlanes[i], bPlanes[i])) {
+        return false;
+      }
+    }
+    const aClipping = a.clippingPlanes || [];
+    const bClipping = b.clippingPlanes || [];
+    if (aClipping.length !== bClipping.length) {
+      return false;
+    }
+    for (let i = 0; i < aClipping.length; i++) {
+      if (!this.planeEquals(aClipping[i], bClipping[i])) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  private planeEquals(a: THREE.Plane, b: THREE.Plane) {
+    return a.constant === b.constant && this.vectorEquals(a.normal, b.normal);
+  }
+
+  private vectorEquals(a: THREE.Vector3, b: THREE.Vector3) {
+    return a.x === b.x && a.y === b.y && a.z === b.z;
   }
 
   private updatePositionIfNeeded() {
@@ -459,10 +565,23 @@ export class VirtualTilesController {
     });
   }
 
+  /**
+   * Defensive only. A camera-less main thread sends a model-containing frustum
+   * rather than omitting one, so this should always be true in practice —
+   * but the field is untyped across the worker boundary, and dereferencing
+   * it unguarded is what turns a missing frustum into a crash on every
+   * frame instead of a degraded view.
+   */
+  private get hasCameraFrustum() {
+    return !!this._virtualView.cameraFrustum;
+  }
+
   private setupViewPlanes() {
     this._virtualPlanes = [];
-    for (const plane of this._virtualView.cameraFrustum.planes) {
-      this._virtualPlanes.push(plane);
+    if (this.hasCameraFrustum) {
+      for (const plane of this._virtualView.cameraFrustum.planes) {
+        this._virtualPlanes.push(plane);
+      }
     }
     if (this._virtualView.clippingPlanes) {
       for (const plane of this._virtualView.clippingPlanes) {
@@ -473,6 +592,8 @@ export class VirtualTilesController {
 
   private updateOrientationIfNeeded() {
     const orientation = this.getCurrentViewOrientation();
+    // No frustum → no camera → orientation tracking is meaningless.
+    if (!orientation) return;
     const orientationThreshold = this._params.updateviewOrientation;
     const orientationChange = orientation.angleTo(this._lastView.rotation);
     const orientationNeedsUpdate = orientationChange > orientationThreshold;
@@ -483,6 +604,9 @@ export class VirtualTilesController {
   }
 
   private getCurrentViewOrientation() {
+    if (!this.hasCameraFrustum) {
+      return undefined;
+    }
     return this._virtualView.cameraFrustum.planes[4].normal;
   }
 
@@ -802,7 +926,7 @@ export class VirtualTilesController {
     const tileIds = this.getTileIds(id, lod);
     if (tileIds === undefined) return;
     MiscHelper.forEach(tileIds, (tileId) => {
-      this.updateTile(tileId, id, high, high === 0);
+      this.updateTile(tileId, id, high, vis);
     });
   }
 
@@ -924,6 +1048,14 @@ export class VirtualTilesController {
         return CurrentLod.INVISIBLE;
       }
       return CurrentLod.GEOMETRY;
+    }
+
+    // Hierarchy verdict first: samples in branches that miss the view
+    // entirely skip the per-sample plane math. Candidates (mask 0) go
+    // through the exact same test as before, so the classification any
+    // sample ends up with is unchanged.
+    if (this._outsideMask[sample]) {
+      return CurrentLod.INVISIBLE;
     }
 
     const item = this._boxes.get(sample);
